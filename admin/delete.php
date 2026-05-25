@@ -24,6 +24,6 @@ $stmt->bind_param("i", $id);
 $stmt->execute();
 
 // 4. Redirect
-header("Location: tampil.php");
+header("Location: index.php");
 exit;
 ?>

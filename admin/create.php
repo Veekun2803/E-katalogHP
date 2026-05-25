@@ -60,7 +60,7 @@ if (isset($_POST['submit'])) {
 
         $conn->commit();
         $_SESSION['msg'] = "Data berhasil disimpan!";
-        header("Location: tampil.php");
+        header("Location: index.php");
         exit;
 
     } catch (Exception $e) {
@@ -81,7 +81,7 @@ if (isset($_POST['submit'])) {
 <div class="max-w-3xl mx-auto bg-white p-8 rounded-3xl shadow-sm border border-gray-100">
     <div class="flex items-center justify-between mb-8">
         <h2 class="text-3xl font-black text-slate-800">Tambah Data HP</h2>
-        <a href="tampil.php" class="text-slate-400 hover:text-slate-600 transition">✕</a>
+        <a href="index.php" class="text-slate-400 hover:text-slate-600 transition">✕</a>
     </div>
 
     <?php if(isset($error)): ?>
@@ -155,7 +155,7 @@ if (isset($_POST['submit'])) {
                 class="flex-1 bg-blue-600 text-white font-bold py-4 rounded-2xl hover:bg-blue-700 transition shadow-lg shadow-blue-100">
                 Simpan Produk
             </button>
-            <a href="tampil.php"
+            <a href="index.php"
                 class="px-8 py-4 bg-slate-100 text-slate-600 font-bold rounded-2xl hover:bg-slate-200 transition">
                 Batal
             </a>

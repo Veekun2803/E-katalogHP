@@ -2,100 +2,117 @@
 session_start();
 include __DIR__ . '/admin/config.php';
 
-if (empty($_SESSION['cart'])) {
+/* =========================
+   WAJIB LOGIN CUSTOMER
+========================= */
+if (!isset($_SESSION['customer_id'])) {
+    header("Location: auth.php");
+    exit;
+}
+
+$customer_id = $_SESSION['customer_id'];
+
+/* =========================
+   AMBIL DATA KERANJANG DARI DB
+========================= */
+$sql_cart = "SELECT c.qty, p.id, p.nama_hp, p.harga, p.stok, p.brand 
+             FROM cart c 
+             JOIN phones p ON c.phone_id = p.id 
+             WHERE c.customer_id = $customer_id";
+$res_cart = $conn->query($sql_cart);
+
+if ($res_cart->num_rows == 0) {
     header("Location: index.php");
     exit;
 }
 
-$cart = $_SESSION['cart'];
 $items = [];
 $grandTotal = 0;
-$wa_admin = "6285862030566"; // Nomor WhatsApp Admin
+$wa_admin = "6285862030566";
 
-foreach ($cart as $id => $qty) {
-    $id = intval($id);
-    $result = $conn->query("SELECT * FROM phones WHERE id=$id");
-    $row = $result->fetch_assoc();
-    if (!$row) continue;
-
+while ($row = $res_cart->fetch_assoc()) {
+    $qty = intval($row['qty']);
     if ($qty > $row['stok']) $qty = $row['stok'];
+    if ($qty <= 0) continue;
+
     $total = $row['harga'] * $qty;
     $grandTotal += $total;
 
-    $img = $conn->query("SELECT image FROM phone_images WHERE phone_id=$id LIMIT 1")->fetch_assoc();
-    $gambar = ($img && file_exists(__DIR__."/admin/uploads/".$img['image'])) ? "admin/uploads/".$img['image'] : "https://via.placeholder.com/150";
-
     $items[] = [
-        'id' => $id,
+        'id' => $row['id'],
         'nama' => $row['nama_hp'],
+        'brand' => $row['brand'],
         'harga' => $row['harga'],
         'qty' => $qty,
-        'total' => $total,
-        'gambar' => $gambar
+        'total' => $total
     ];
 }
 
+/* =========================
+   AMBIL DATA CUSTOMER
+========================= */
+$user = $conn->query("SELECT * FROM customers WHERE id = $customer_id")->fetch_assoc();
+
+/* =========================
+   PROSES CHECKOUT
+========================= */
 if (isset($_POST['checkout'])) {
-    $nama   = $_POST['nama'];
-    $no_wa  = $_POST['no_wa'];
-    $alamat = $_POST['alamat'];
+    $nama   = htmlspecialchars($_POST['nama']);
+    $wa     = htmlspecialchars($_POST['no_wa']);
+    $alamat = htmlspecialchars($_POST['alamat']);
     $metode = $_POST['metode'];
 
-    // Proses Bukti Pembayaran
     $bukti = '';
     if (!empty($_FILES['bukti']['name'])) {
         $ext = strtolower(pathinfo($_FILES['bukti']['name'], PATHINFO_EXTENSION));
-        $bukti = uniqid() . '.' . $ext;
-        $uploadDir = __DIR__ . "/uploads/";
-        if (!is_dir($uploadDir)) mkdir($uploadDir, 0777, true);
-        move_uploaded_file($_FILES['bukti']['tmp_name'], $uploadDir . $bukti);
+        $allowed = ['jpg','jpeg','png'];
+
+        if (in_array($ext, $allowed)) {
+            $bukti = uniqid() . '.' . $ext;
+            $uploadDir = __DIR__ . "/admin/uploads/bukti_bayar/";
+
+            if (!is_dir($uploadDir)) {
+                mkdir($uploadDir, 0777, true);
+            }
+            move_uploaded_file($_FILES['bukti']['tmp_name'], $uploadDir . $bukti);
+        }
     }
 
-    // Simpan ke DB
-    $stmt = $conn->prepare("INSERT INTO orders (nama, alamat, no_wa, total, metode, bukti, status) VALUES (?, ?, ?, ?, ?, ?, 'pending')");
-    $stmt->bind_param("sssiss", $nama, $alamat, $no_wa, $grandTotal, $metode, $bukti);
+    // 1. Simpan Pesanan ke Tabel Orders
+    $stmt = $conn->prepare("INSERT INTO orders (customer_id, nama, alamat, no_wa, total, metode, bukti, status) VALUES (?,?,?,?,?,?,?, 'pending')");
+    $stmt->bind_param("isssiss", $customer_id, $nama, $alamat, $wa, $grandTotal, $metode, $bukti);
     $stmt->execute();
     $order_id = $conn->insert_id;
 
+    // 2. Simpan/Perbarui Alamat & Kontak ke Tabel Customers (Auto-Save Profil)
+    $stmtUpdate = $conn->prepare("UPDATE customers SET nama_lengkap=?, no_wa=?, alamat=? WHERE id=?");
+    $stmtUpdate->bind_param("sssi", $nama, $wa, $alamat, $customer_id);
+    $stmtUpdate->execute();
+
+    // 3. Masukkan Detail Barang ke Order Items dan Kurangi Stok
     foreach ($items as $item) {
-        $stmtItem = $conn->prepare("INSERT INTO order_items (order_id, phone_id, qty, harga) VALUES (?, ?, ?, ?)");
+        $stmtItem = $conn->prepare("INSERT INTO order_items (order_id, phone_id, qty, harga) VALUES (?,?,?,?)");
         $stmtItem->bind_param("iiii", $order_id, $item['id'], $item['qty'], $item['harga']);
         $stmtItem->execute();
         $conn->query("UPDATE phones SET stok = stok - {$item['qty']} WHERE id = {$item['id']}");
     }
 
-    unset($_SESSION['cart']);
+    // 4. Kosongkan Keranjang Belanja
+    $conn->query("DELETE FROM cart WHERE customer_id = $customer_id");
 
-    // Pesan WA
+    // 5. Buat Pesan WhatsApp
     $pesan = "*PESANAN BARU - #INV$order_id*\n\n";
-    $pesan .= "Nama: $nama\nAlamat: $alamat\nTotal: Rp " . number_format($grandTotal,0,',','.') . "\nMetode: $metode\n\n_Mohon segera diproses admin._";
+    $pesan .= "Nama: $nama\n";
+    $pesan .= "Metode: " . strtoupper($metode) . "\n";
+    $pesan .= "Total: Rp " . number_format($grandTotal,0,',','.') . "\n\n";
+    $pesan .= "Detail Barang:\n";
+    foreach($items as $i) { $pesan .= "- {$i['nama']} ({$i['qty']}x)\n"; }
+
     $link_wa = "https://wa.me/$wa_admin?text=" . urlencode($pesan);
-    ?>
-    <!DOCTYPE html>
-    <html lang="id">
-    <head>
-        <meta charset="UTF-8"><title>Success - PhoneStore</title>
-        <script src="https://cdn.tailwindcss.com"></script>
-        <link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;700&display=swap" rel="stylesheet">
-    </head>
-    <body class="bg-slate-50 font-['Plus_Jakarta_Sans'] flex items-center justify-center min-h-screen p-4">
-        <div class="bg-white p-8 rounded-[2rem] shadow-xl shadow-blue-100 text-center max-w-md border border-blue-50">
-            <div class="w-20 h-20 bg-green-100 text-green-600 rounded-full flex items-center justify-center mx-auto mb-6">
-                <svg xmlns="http://www.w3.org/2000/svg" class="h-10 w-10" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="3" d="M5 13l4 4L19 7" /></svg>
-            </div>
-            <h2 class="text-3xl font-black text-gray-900 mb-2">Terima Kasih!</h2>
-            <p class="text-gray-500 mb-8 font-medium">Pesanan <span class="text-blue-600 font-bold">#INV<?= $order_id ?></span> berhasil dibuat. Konfirmasi via WhatsApp untuk mempercepat proses pengiriman.</p>
-            <div class="space-y-3">
-                <a href="<?= $link_wa ?>" target="_blank" class="block w-full bg-[#25D366] hover:bg-[#128C7E] text-white font-bold py-4 rounded-2xl transition shadow-lg shadow-green-100 flex items-center justify-center gap-2">
-                    Kirim Konfirmasi WA
-                </a>
-                <a href="index.php" class="block w-full bg-gray-100 hover:bg-gray-200 text-gray-600 font-bold py-4 rounded-2xl transition">Kembali Belanja</a>
-            </div>
-        </div>
-        <script>setTimeout(() => { window.open("<?= $link_wa ?>", "_blank"); }, 2000);</script>
-    </body>
-    </html>
-    <?php exit;
+
+    // Redirect ke Halaman Sukses
+    header("Location: success.php?wa=".urlencode($link_wa));
+    exit;
 }
 ?>
 
@@ -103,127 +120,172 @@ if (isset($_POST['checkout'])) {
 <html lang="id">
 <head>
     <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Checkout - PhoneStore</title>
     <script src="https://cdn.tailwindcss.com"></script>
     <link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;600;700;800&display=swap" rel="stylesheet">
-    <style>body { font-family: 'Plus Jakarta Sans', sans-serif; }</style>
+    <style>
+        body { font-family: 'Plus Jakarta Sans', sans-serif; }
+        .custom-scrollbar::-webkit-scrollbar { width: 4px; }
+        .custom-scrollbar::-webkit-scrollbar-track { background: transparent; }
+        .custom-scrollbar::-webkit-scrollbar-thumb { background: #cbd5e1; border-radius: 10px; }
+    </style>
 </head>
-<body class="bg-slate-50 pb-20">
+<body class="bg-slate-50 min-h-screen p-4 md:p-8 lg:p-12 text-slate-800">
 
-<div class="max-w-6xl mx-auto px-4 py-10">
-    <div class="flex items-center gap-4 mb-10">
-        <a href="cart.php" class="bg-white p-2 rounded-xl border border-gray-100 shadow-sm hover:bg-gray-50 transition">
-            <svg xmlns="http://www.w3.org/2000/svg" class="h-6 w-6 text-gray-600" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 19l-7-7 7-7" /></svg>
-        </a>
-        <h1 class="text-3xl font-black text-gray-900">Checkout</h1>
+<div class="max-w-6xl mx-auto">
+    <div class="mb-10">
+        <h1 class="text-4xl font-black text-slate-800 tracking-tighter italic">Checkout <span class="text-blue-600">Pesanan</span></h1>
+        <div class="mt-4 flex items-center gap-3">
+            <span class="flex h-2 w-2 rounded-full bg-emerald-500 animate-pulse"></span>
+            <p class="text-[10px] font-black text-slate-400 uppercase tracking-[0.2em]">Sesi Enkripsi Checkout Aman</p>
+        </div>
     </div>
 
-    <form method="POST" enctype="multipart/form-data" class="grid grid-cols-1 lg:grid-cols-12 gap-10">
+    <div class="grid grid-cols-1 lg:grid-cols-3 gap-10 items-start">
         
-        <div class="lg:col-span-7 space-y-6">
-            <div class="bg-white p-8 rounded-3xl shadow-sm border border-gray-100">
-                <h3 class="text-xl font-bold mb-6 flex items-center gap-2">
-                    <span class="w-8 h-8 bg-blue-600 text-white rounded-lg flex items-center justify-center text-sm">1</span>
-                    Informasi Pengiriman
-                </h3>
-                <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
-                    <div class="space-y-2">
-                        <label class="text-sm font-bold text-gray-700 ml-1">Nama Lengkap</label>
-                        <input type="text" name="nama" required class="w-full bg-gray-50 border-none ring-1 ring-gray-200 rounded-xl p-3 focus:ring-2 focus:ring-blue-500 outline-none transition" placeholder="John Doe">
-                    </div>
-                    <div class="space-y-2">
-                        <label class="text-sm font-bold text-gray-700 ml-1">WhatsApp</label>
-                        <input type="text" name="no_wa" required class="w-full bg-gray-50 border-none ring-1 ring-gray-200 rounded-xl p-3 focus:ring-2 focus:ring-blue-500 outline-none transition" placeholder="628xxx">
-                    </div>
-                    <div class="md:col-span-2 space-y-2">
-                        <label class="text-sm font-bold text-gray-700 ml-1">Alamat Lengkap</label>
-                        <textarea name="alamat" rows="3" required class="w-full bg-gray-50 border-none ring-1 ring-gray-200 rounded-xl p-3 focus:ring-2 focus:ring-blue-500 outline-none transition" placeholder="Nama Jalan, No. Rumah, Kota, Kode Pos"></textarea>
-                    </div>
-                </div>
-            </div>
-
-            <div class="bg-white p-8 rounded-3xl shadow-sm border border-gray-100">
-                <h3 class="text-xl font-bold mb-6 flex items-center gap-2">
-                    <span class="w-8 h-8 bg-blue-600 text-white rounded-lg flex items-center justify-center text-sm">2</span>
-                    Pembayaran
-                </h3>
-                <div class="space-y-4">
-                    <div class="grid grid-cols-2 gap-4">
-                        <label class="relative flex items-center justify-center p-4 border-2 border-gray-100 rounded-2xl cursor-pointer hover:bg-gray-50 has-[:checked]:border-blue-600 has-[:checked]:bg-blue-50 transition">
-                            <input type="radio" name="metode" value="bank" required class="sr-only">
-                            <span class="font-bold text-gray-700">Transfer Bank</span>
-                        </label>
-                        <label class="relative flex items-center justify-center p-4 border-2 border-gray-100 rounded-2xl cursor-pointer hover:bg-gray-50 has-[:checked]:border-blue-600 has-[:checked]:bg-blue-50 transition">
-                            <input type="radio" name="metode" value="qris" required class="sr-only">
-                            <span class="font-bold text-gray-700">QRIS</span>
-                        </label>
-                    </div>
-                    <div class="bg-blue-50 p-4 rounded-2xl border border-blue-100">
-                        <p class="text-sm text-blue-800 leading-relaxed">
-                            <b>BCA:</b> 123456789 a.n Toko HP <br>
-                            <b>Mandiri:</b> 987654321 a.n Toko HP
-                        </p>
-                    </div>
-                    <div class="space-y-2">
-                        <label class="text-sm font-bold text-gray-700 ml-1">Upload Bukti Transfer</label>
-                        <div class="border-2 border-dashed border-gray-200 rounded-2xl p-4 text-center hover:border-blue-400 transition cursor-pointer relative">
-                            <input type="file" name="bukti" class="absolute inset-0 opacity-0 cursor-pointer" onchange="previewFile(this)">
-                            <div id="preview-text" class="text-gray-400 text-sm">Klik atau seret foto bukti di sini</div>
+        <div class="lg:col-span-2">
+            <div class="bg-white p-8 md:p-10 rounded-[2.5rem] shadow-xl shadow-slate-200/40 border border-slate-100">
+                <form method="POST" enctype="multipart/form-data" class="space-y-12">
+                    
+                    <section>
+                        <div class="flex items-center gap-4 mb-8">
+                            <span class="w-10 h-10 bg-blue-600 text-white rounded-2xl flex items-center justify-center text-sm font-black shadow-lg shadow-blue-100">01</span>
+                            <h2 class="text-xl font-black text-slate-800 tracking-tight">Detail Pengiriman</h2>
                         </div>
-                    </div>
-                </div>
+                        <div class="grid grid-cols-1 md:grid-cols-2 gap-6">
+                            <div class="space-y-2">
+                                <label class="text-[10px] font-black text-slate-400 uppercase tracking-[0.2em] ml-1">Nama Penerima</label>
+                                <input type="text" name="nama" required value="<?= htmlspecialchars($user['nama_lengkap'] ?? '') ?>"
+                                class="w-full bg-slate-50 border-none p-4 rounded-2xl ring-1 ring-slate-100 focus:ring-2 focus:ring-blue-500 outline-none font-bold text-sm transition-all">
+                            </div>
+                            <div class="space-y-2">
+                                <label class="text-[10px] font-black text-slate-400 uppercase tracking-[0.2em] ml-1">WhatsApp</label>
+                                <input type="text" name="no_wa" required value="<?= htmlspecialchars($user['no_wa'] ?? '') ?>"
+                                class="w-full bg-slate-50 border-none p-4 rounded-2xl ring-1 ring-slate-100 focus:ring-2 focus:ring-blue-500 outline-none font-bold text-sm transition-all">
+                            </div>
+                            <div class="md:col-span-2 space-y-2">
+                                <label class="text-[10px] font-black text-slate-400 uppercase tracking-[0.2em] ml-1">Alamat Pengiriman</label>
+                                <textarea name="alamat" required rows="3"
+                                class="w-full bg-slate-50 border-none p-4 rounded-2xl ring-1 ring-slate-100 focus:ring-2 focus:ring-blue-500 outline-none font-bold text-sm transition-all"><?= htmlspecialchars($user['alamat'] ?? '') ?></textarea>
+                            </div>
+                        </div>
+                    </section>
+
+                    <section>
+                        <div class="flex items-center gap-4 mb-8">
+                            <span class="w-10 h-10 bg-blue-600 text-white rounded-2xl flex items-center justify-center text-sm font-black shadow-lg shadow-blue-100">02</span>
+                            <h2 class="text-xl font-black text-slate-800 tracking-tight">Metode Pembayaran</h2>
+                        </div>
+                        <div class="grid grid-cols-1 md:grid-cols-2 gap-6 mb-8">
+                            <div class="space-y-2">
+                                <label class="text-[10px] font-black text-slate-400 uppercase tracking-[0.2em] ml-1">Pilih Metode</label>
+                                <select name="metode" id="metode_pembayaran" required onchange="updatePaymentInfo()"
+                                    class="w-full bg-slate-50 border-none p-4 rounded-2xl ring-1 ring-slate-100 focus:ring-2 focus:ring-blue-500 outline-none font-black text-sm cursor-pointer appearance-none">
+                                    <option value="bank">Transfer Bank (SeaBank)</option>
+                                    <option value="qris">QRIS All Payment</option>
+                                </select>
+                            </div>
+                            <div class="space-y-2">
+                                <label class="text-[10px] font-black text-slate-400 uppercase tracking-[0.2em] ml-1">Bukti Transfer</label>
+                                <input type="file" name="bukti" required class="block w-full text-[10px] text-slate-400
+                                    file:mr-4 file:py-3.5 file:px-6 file:rounded-xl file:border-0
+                                    file:text-[10px] file:font-black file:bg-blue-600 file:text-white
+                                    hover:file:bg-blue-700 transition-all cursor-pointer">
+                            </div>
+                        </div>
+
+                        <div id="payment_info" class="p-8 rounded-[2.5rem] border-2 border-dashed border-slate-100 bg-slate-50/50 transition-all min-h-[160px] flex items-center justify-center">
+                        </div>
+                    </section>
+
+                    <button name="checkout" class="group flex items-center justify-center gap-2 w-full bg-blue-600 hover:bg-blue-700 text-white font-bold py-4 rounded-2xl transition-all shadow-lg shadow-blue-100 active:scale-[0.98] text-sm uppercase tracking-wider">
+                        Konfirmasi & Bayar
+                        <svg xmlns="http://www.w3.org/2000/svg" class="h-4 w-4 transform group-hover:translate-x-1 transition-transform" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="3" d="M13 7l5 5m0 0l-5 5m5-5H6" />
+                        </svg>
+                    </button>
+                </form>
             </div>
         </div>
 
-        <div class="lg:col-span-5">
-            <div class="bg-white p-8 rounded-3xl shadow-sm border border-gray-100 sticky top-24">
-                <h3 class="text-xl font-bold mb-6">Ringkasan Pesanan</h3>
-                <div class="max-h-[400px] overflow-y-auto pr-2 space-y-4 mb-6">
-                    <?php foreach ($items as $item): ?>
-                    <div class="flex items-center gap-4">
-                        <img src="<?= $item['gambar'] ?>" class="w-16 h-16 object-cover rounded-xl shadow-sm border border-gray-50">
+        <div class="lg:col-span-1 space-y-4 sticky top-10">
+            <a href="cart.php" class="flex items-center justify-center gap-2 w-full bg-white px-4 py-3 rounded-xl border border-slate-200 shadow-sm text-slate-500 hover:text-blue-600 hover:border-blue-200 transition-all active:scale-[0.98] group">
+                <svg xmlns="http://www.w3.org/2000/svg" class="h-3.5 w-3.5 transform group-hover:-translate-x-1 transition-transform" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2.5" d="M15 19l-7-7 7-7" />
+                </svg>
+                <span class="text-[9px] font-black uppercase tracking-widest">Kembali ke Keranjang</span>
+            </a>
+
+            <div class="bg-white p-8 rounded-[2.5rem] shadow-xl shadow-slate-200/40 border border-slate-100">
+                <h2 class="text-lg font-black mb-6 text-slate-800 flex justify-between items-center tracking-tight">
+                    Pesananmu
+                    <span class="text-[10px] font-black bg-slate-100 text-slate-400 px-3 py-1 rounded-full tracking-widest uppercase"><?= count($items) ?> Item</span>
+                </h2>
+                
+                <div class="space-y-4 max-h-[280px] overflow-y-auto pr-2 custom-scrollbar mb-8">
+                    <?php foreach ($items as $i): ?>
+                    <div class="flex justify-between items-start gap-4 pb-4 border-b border-slate-50 last:border-0 group">
                         <div class="flex-1">
-                            <h4 class="font-bold text-gray-800 leading-tight line-clamp-1"><?= $item['nama'] ?></h4>
-                            <p class="text-sm text-gray-400"><?= $item['qty'] ?> x Rp <?= number_format($item['harga'],0,',','.') ?></p>
+                            <p class="font-bold text-slate-700 text-xs leading-tight group-hover:text-blue-600 transition-colors"><?= $i['nama'] ?></p>
+                            <p class="text-[9px] font-black text-slate-400 uppercase mt-1 tracking-wider italic"><?= $i['qty'] ?> Unit × Rp<?= number_format($i['harga'],0,',','.') ?></p>
                         </div>
-                        <div class="font-bold text-gray-900 text-sm">Rp <?= number_format($item['total'],0,',','.') ?></div>
+                        <span class="font-black text-slate-800 text-[11px] text-right">Rp<?= number_format($i['total'],0,',','.') ?></span>
                     </div>
                     <?php endforeach; ?>
                 </div>
 
-                <div class="border-t border-dashed border-gray-100 pt-6 space-y-3">
-                    <div class="flex justify-between text-gray-500 font-medium">
-                        <span>Subtotal</span>
-                        <span>Rp <?= number_format($grandTotal,0,',','.') ?></span>
+                <div class="space-y-3 pt-6 border-t-2 border-dashed border-slate-100">
+                    <div class="flex justify-between text-[9px] font-black text-slate-400 uppercase tracking-[0.2em]">
+                        <span>Pengiriman</span>
+                        <span class="text-emerald-500 font-bold">Gratis Ongkir</span>
                     </div>
-                    <div class="flex justify-between text-gray-500 font-medium">
-                        <span>Biaya Admin</span>
-                        <span class="text-green-600">Free</span>
-                    </div>
-                    <div class="flex justify-between items-center pt-2">
-                        <span class="text-lg font-black text-gray-900">Total</span>
-                        <span class="text-2xl font-black text-blue-600">Rp <?= number_format($grandTotal,0,',','.') ?></span>
+                    <div class="pt-2">
+                        <p class="text-[10px] font-black text-blue-400 uppercase tracking-[0.2em] mb-1">Total Tagihan</p>
+                        <p class="text-3xl font-black text-blue-600 tracking-tighter">Rp<?= number_format($grandTotal,0,',','.') ?></p>
                     </div>
                 </div>
-
-                <button name="checkout" class="w-full bg-blue-600 hover:bg-blue-700 text-white font-bold py-4 rounded-2xl mt-8 transition shadow-lg shadow-blue-100 flex items-center justify-center gap-2 group">
-                    Bayar Sekarang
-                    <svg xmlns="http://www.w3.org/2000/svg" class="h-5 w-5 group-hover:translate-x-1 transition" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M14 5l7 7m0 0l-7 7m7-7H3" /></svg>
-                </button>
             </div>
         </div>
 
-    </form>
+    </div>
 </div>
 
 <script>
-    function previewFile(input) {
-        const text = document.getElementById('preview-text');
-        if (input.files && input.files[0]) {
-            text.innerHTML = "📄 " + input.files[0].name;
-            text.classList.add('text-blue-600', 'font-bold');
-        }
+function updatePaymentInfo() {
+    const metode = document.getElementById('metode_pembayaran').value;
+    const infoDiv = document.getElementById('payment_info');
+    
+    if (metode === 'bank') {
+        infoDiv.innerHTML = `
+            <div class="flex flex-col md:flex-row items-center gap-6 w-full animate-in fade-in zoom-in duration-300">
+                <div class="bg-white p-4 rounded-2xl shadow-sm border border-slate-100 flex-shrink-0">
+                    <img src="https://images.seeklogo.com/logo-png/62/2/seabank-logo-png_seeklogo-620133.png" 
+                         class="h-8 w-auto object-contain" alt="SeaBank">
+                </div>
+                <div class="text-center md:text-left">
+                    <p class="text-[9px] font-black text-blue-500 uppercase tracking-[0.2em] mb-1 italic">Rekening Transfer (SeaBank)</p>
+                    <p class="text-2xl font-black text-slate-800 tracking-widest">9017 5486 5539</p>
+                    <p class="text-[10px] font-bold text-slate-400 uppercase mt-1">a.n FAISAL DWIKI NURDIANSYAH</p>
+                </div>
+            </div>
+        `;
+    } else if (metode === 'qris') {
+        infoDiv.innerHTML = `
+            <div class="text-center w-full py-4 animate-in fade-in zoom-in duration-300">
+                <p class="text-[9px] font-black text-blue-500 uppercase tracking-[0.2em] mb-8 italic">Scan QRIS All Payment</p>
+                <div class="bg-white p-6 rounded-[3rem] inline-block shadow-2xl border border-slate-50 mb-8 group transition-transform hover:scale-105">
+                    <img src="qris.jpeg" class="w-64 mx-auto rounded-xl" alt="QRIS">
+                </div>
+                <div class="flex items-center justify-center gap-2">
+                    <span class="flex h-1.5 w-1.5 rounded-full bg-emerald-500"></span>
+                    <p class="text-[9px] font-black text-slate-400 uppercase tracking-widest italic">OVO • DANA • GOPAY • SHOPEEPAY • LINKAJA</p>
+                </div>
+            </div>
+        `;
     }
+}
+window.onload = updatePaymentInfo;
 </script>
 
 </body>
